@@ -1,22 +1,42 @@
 #!/usr/bin/env python
-
+import os
 import re
+import shutil
+import sqlite3
 import sys
 import time
 import json
+import uuid
 import zipfile
 import collections
+from builtins import OSError, input
 
 from pathlib import Path
 
-
 # You can adjust some setting here. Default is for QOwnNotes app.
 media_dir_name = 'media'  # name of the directory inside the produced directory where all images and attachments will be stored
+wiz_home_path = Path('C:\\Users\\demo\\Documents\\My Knowledge\\Data\\admin@wiz.cn')
+wiz_index_db = Path(wiz_home_path / 'index.db')
 creation_date_in_filename = False  # True to insert note creation time to the note file name, False to disable
 
 ############################################################################
 
 Notebook = collections.namedtuple('Notebook', ['path', 'media_path'])
+
+WizNote = collections.namedtuple("WizNote", ['path'])
+
+
+def zip_ya(startdir):
+    startdir = str(startdir)
+    file_news = startdir + '.ziw'  # 压缩后文件夹的名字
+    z = zipfile.ZipFile(file_news, 'w', zipfile.ZIP_DEFLATED)  # 参数一：文件夹名
+    for dirpath, dirnames, filenames in os.walk(startdir):
+        fpath = dirpath.replace(startdir, '')  # 这一句很重要，不replace的话，就从根目录开始复制
+        fpath = fpath and fpath + os.sep or ''  # 这句话理解我也点郁闷，实现当前文件夹以及包含的所有文件的压缩
+        for filename in filenames:
+            z.write(os.path.join(dirpath, filename), fpath + filename)
+            print('压缩成功')
+    z.close()
 
 
 def sanitise_path_string(path_str):
@@ -26,14 +46,15 @@ def sanitise_path_string(path_str):
         path_str = path_str.replace(char, '')
     path_str = path_str.replace('<', '(')
     path_str = path_str.replace('>', ')')
-    path_str = path_str.replace('"', "'")
+    path_str = path_str.replace('"', "")
+    path_str = path_str.replace("'", "")
+    path_str = path_str.replace('\n', "")
 
-    return path_str[:240]
+    return path_str[:240].strip()
 
 
 work_path = Path.cwd()
 media_dir_name = sanitise_path_string(media_dir_name)
-
 
 if len(sys.argv) > 1:
     files_to_convert = [Path(path) for path in sys.argv[1:]]
@@ -48,6 +69,7 @@ for file in files_to_convert:
     nsx_file = zipfile.ZipFile(str(file))
     config_data = json.loads(nsx_file.read('config.json').decode('utf-8'))
     notebook_id_to_path_index = {}
+    wiz_notebook_id_to_path_index = {}
 
     recycle_bin_path = work_path / Path('Recycle bin')
 
@@ -61,7 +83,6 @@ for file in files_to_convert:
     notebook_id_to_path_index['1027_#00000000'] = Notebook(recycle_bin_path, recycle_bin_media_path)
 
     print('Extracting notes from "{}"'.format(file.name))
-
     for notebook_id in config_data['notebook']:
         notebook_data = json.loads(nsx_file.read(notebook_id).decode('utf-8'))
         notebook_title = notebook_data['title'] or 'Untitled'
@@ -77,7 +98,12 @@ for file in files_to_convert:
 
         notebook_id_to_path_index[notebook_id] = Notebook(notebook_path, notebook_media_path)
 
+        wiz_notebook_path = Path(wiz_home_path / 'dsnote' / sanitise_path_string(notebook_title))
+        wiz_notebook_path.mkdir(parents=True)
+        wiz_notebook_id_to_path_index[notebook_id] = WizNote(wiz_notebook_path)
+
     note_id_to_title_index = {}
+    wiz_note_id_to_title_index = {}
     converted_note_ids = []
 
     for note_id in config_data['note']:
@@ -86,12 +112,18 @@ for file in files_to_convert:
         note_title = note_data.get('title', 'Untitled')
         note_ctime = note_data.get('ctime', '')
         note_mtime = note_data.get('mtime', '')
+        note_parent_notebook_id = note_data.get('parent_id','')
+        notebook_data = json.loads(nsx_file.read(note_parent_notebook_id).decode('utf-8'))
+        notebook_title = notebook_data['title'] or 'Untitled'
 
         note_id_to_title_index[note_id] = note_title
+        wiz_note_id_to_title_index[note_id] = note_title
 
         try:
             parent_notebook_id = note_data['parent_id']
             parent_notebook = notebook_id_to_path_index[parent_notebook_id]
+            wiz_parent_notebook = wiz_notebook_id_to_path_index[parent_notebook_id]
+            wiz_note_path = wiz_parent_notebook.path / sanitise_path_string(note_title)
         except KeyError:
             continue
 
@@ -99,9 +131,12 @@ for file in files_to_convert:
 
         content = re.sub('<img class="[^"]*syno-notestation-image-object" src=[^>]*ref="',
                          '<img src="', note_data.get('content', ''))
+        wiz_content = re.sub('<img class="[^"]*syno-notestation-image-object" src=[^>]*ref="',
+                             '<img src="', note_data.get('content', ''))
 
         attachments_data = note_data.get('attachment')
         attachment_list = []
+        wiz_attachment_list = []
 
         if attachments_data:
             for attachment_id in note_data.get('attachment', ''):
@@ -118,11 +153,20 @@ for file in files_to_convert:
                     n += 1
 
                 link_path_str = '{}/{}'.format(media_dir_name, name)
+                wiz_index_files_link_path_str = '{}/{}'.format('index_files', name)
+
                 html_link_template = '<a href="{}">{}</a>'
 
                 try:
                     Path(parent_notebook.media_path / name).write_bytes(nsx_file.read('file_' + md5))
+
+                    if not Path(wiz_note_path / 'index_files').exists():
+                        Path(wiz_note_path / 'index_files').mkdir(mode=0o777, parents=True)
+                    Path(wiz_note_path / 'index_files' / name).write_bytes(
+                        nsx_file.read('file_' + md5))
+
                     attachment_list.append(html_link_template.format(link_path_str, name))
+                    wiz_attachment_list.append(html_link_template.format(wiz_index_files_link_path_str, name))
                 except Exception:
                     if source:
                         attachment_list.append(html_link_template.format(source, name))
@@ -135,21 +179,81 @@ for file in files_to_convert:
                 elif ref:
                     content = content.replace(ref, link_path_str)
 
+                if ref and source:
+                    wiz_content = wiz_content.replace(ref, source)
+                elif ref:
+                    wiz_content = wiz_content.replace(ref, wiz_index_files_link_path_str)
+
         if attachment_list:
             content = 'Attachments: {}  \n{}'.format(', '.join(attachment_list), content)
+        if wiz_attachment_list:
+            wiz_content = '<meta http-equiv="Content-Type" content="text/html; charset=utf-8" /> Attachments: {}  \n{}'.format(', '.join(wiz_attachment_list), wiz_content)
         if creation_date_in_filename and note_ctime:
             note_title = time.strftime('%Y-%m-%d ', time.localtime(note_ctime)) + note_title
 
         md_file_name = sanitise_path_string(note_title) or 'Untitled'
         md_file_path = Path(parent_notebook.path / '{}.{}'.format(md_file_name, 'htm'))
+        wiz_md_file_path = Path(wiz_note_path / '{}.{}'.format("index", 'html'))
 
         n = 1
         while md_file_path.is_file():
             md_file_path = Path(parent_notebook.path / ('{}_{}.{}'.format(
-                                            sanitise_path_string(note_title), n, 'htm')))
+                sanitise_path_string(note_title), n, 'htm')))
             n += 1
 
+        if not Path(wiz_note_path).exists():
+            Path(wiz_note_path).mkdir(mode=0o777, parents=True)
+
         md_file_path.write_text(content, 'utf-8')
+        wiz_md_file_path.write_text(wiz_content, 'utf-8')
+
+        zip_ya(wiz_note_path)
+        shutil.rmtree(wiz_note_path)
+
+        conn = sqlite3.connect(wiz_index_db)
+        c = conn.cursor()
+        print
+        "Opened database successfully";
+
+        sql = 'INSERT INTO "main"."WIZ_DOCUMENT" (' \
+              '"DOCUMENT_GUID", "DOCUMENT_TITLE", "DOCUMENT_LOCATION", ' \
+              '"DOCUMENT_NAME", "DOCUMENT_SEO", "DOCUMENT_URL", ' \
+              '"DOCUMENT_AUTHOR", "DOCUMENT_KEYWORDS", "DOCUMENT_TYPE", ' \
+              '"DOCUMENT_OWNER", "DOCUMENT_FILE_TYPE", "STYLE_GUID", ' \
+              '"DT_CREATED", "DT_MODIFIED", "DT_ACCESSED", ' \
+              '"DOCUMENT_ICON_INDEX", "DOCUMENT_SYNC", "DOCUMENT_PROTECT",' \
+              ' "DOCUMENT_READ_COUNT", "DOCUMENT_ATTACHEMENT_COUNT", "DOCUMENT_INDEXED",' \
+              ' "DT_INFO_MODIFIED", "DOCUMENT_INFO_MD5", "DT_DATA_MODIFIED",' \
+              ' "DOCUMENT_DATA_MD5", "DT_PARAM_MODIFIED", "DOCUMENT_PARAM_MD5",' \
+              ' "WIZ_VERSION", "KB_GUID", "WIZ_DOWNLOADED",' \
+              ' "WIZ_SERVER_VERSION", "WIZ_LOCAL_FLAGS", "DOCUMENT_SOURCELOCATION",' \
+              ' "DATA_CHANGED")  \
+                      VALUES (' \
+              '"{}","{}","{}",' \
+              '"{}",{},{},' \
+              '{},{},"{}",' \
+              '"{}",{},{},' \
+              '"{}","{}","{}",' \
+              '{},{},{},' \
+              '{},{},{},' \
+              '"{}",{},"{}",' \
+              '"{}","{}",{},' \
+              '{},{},{},' \
+              '{},{},{},' \
+              '{});'
+
+        sql_format = sql.format(uuid.uuid1(), sanitise_path_string(note_title) ,'/dsnote/' + notebook_title + '/',
+                                sanitise_path_string(note_title) + '.ziw', "NULL", "NULL", "NULL", "NULL", "document",
+                                "admin@wiz.cn", "NULL",
+                                "NULL", note_ctime, note_mtime, note_mtime, -1, 0, 0, 6, 0, 1, note_ctime, "NULL",
+                                note_mtime, note_id, note_ctime, "NULL", 2308, "NULL", 1, 2308, "NULL", "NULL", 0, sql)
+        print(sql_format)
+        conn.execute(sql_format)
+
+        conn.commit()
+        print
+        "Records created successfully";
+        conn.close()
 
         converted_note_ids.append(note_id)
 
@@ -181,6 +285,5 @@ for file in files_to_convert:
         recycle_bin_path.rmdir()
     except OSError:
         pass
-
 
 input('Press Enter to quit...')
